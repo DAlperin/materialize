@@ -2126,7 +2126,7 @@ steps:
           composition: sqllogictest
           run: slow-tests
           args: [--replicas=4, --parallelism=8]
-  
+
   - id: iceberg
     label: "Iceberg tests"
     depends_on: build-aarch64
