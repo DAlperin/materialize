@@ -261,6 +261,7 @@ mod v79_to_v80;
 mod v80_to_v81;
 mod v81_to_v82;
 mod v82_to_v83;
+mod v83_to_v84;
 
 /// Describes a single action to take during a migration from `V1` to `V2`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -419,7 +420,7 @@ async fn run_upgrade(
         // needs raw access to the snapshot's diffs (which `run_versioned_upgrade`
         // strips) so it plugs into `run_upgrade` directly.
         82 => v82_to_v83::upgrade(unopened_catalog_state, commit_ts).await,
-
+        83 => v83_to_v84::upgrade(unopened_catalog_state, commit_ts).await,
         // Up-to-date, no migration needed!
         CATALOG_VERSION => Ok((CATALOG_VERSION, commit_ts)),
         FUTURE_VERSION.. => Err(incompatible),
