@@ -248,6 +248,28 @@ struct FinishedBatch {
     data_ts: mz_repr::Timestamp,
 }
 
+fn read_only_upper_advanced_past_batch(
+    batch_lower: &Antichain<mz_repr::Timestamp>,
+    _batch_upper: &Antichain<mz_repr::Timestamp>,
+    current_upper: &Antichain<mz_repr::Timestamp>,
+) -> bool {
+    PartialOrder::less_than(batch_lower, current_upper)
+}
+
+fn externally_committed_batch_upper_to_report(
+    reported_upper: &Antichain<mz_repr::Timestamp>,
+    batch_upper: &Antichain<mz_repr::Timestamp>,
+    actual_upper: &Antichain<mz_repr::Timestamp>,
+) -> Option<Antichain<mz_repr::Timestamp>> {
+    if !PartialOrder::less_than(actual_upper, batch_upper)
+        && PartialOrder::less_than(reported_upper, batch_upper)
+    {
+        Some(batch_upper.clone())
+    } else {
+        None
+    }
+}
+
 /// Continuously writes the `desired_stream` into persist
 /// This is done via a multi-stage operator graph:
 ///
@@ -1222,7 +1244,11 @@ fn append_batches<'scope>(
 
                             let current_upper = write.fetch_recent_upper().await;
 
-                            if PartialOrder::less_than(&batch_upper, current_upper) {
+                            if read_only_upper_advanced_past_batch(
+                                &batch_lower,
+                                &batch_upper,
+                                current_upper,
+                            ) {
                                 // We synthesize an `UpperMismatch` so that we can go
                                 // through the same logic below for trimming down our
                                 // batches.
@@ -1376,6 +1402,21 @@ fn append_batches<'scope>(
                             // Best-effort attempt to delete unneeded batches.
                             future::join_all(batch_delete_futures).await;
                         } else {
+                            let externally_committed_upper = {
+                                let reported_upper = current_upper.borrow();
+                                externally_committed_batch_upper_to_report(
+                                    &*reported_upper,
+                                    &batch_upper,
+                                    &mismatch.current,
+                                )
+                            };
+                            if let Some(externally_committed_upper) = externally_committed_upper {
+                                current_upper
+                                    .borrow_mut()
+                                    .clone_from(&externally_committed_upper);
+                                upper_cap_set.downgrade(current_upper.borrow().iter());
+                            }
+
                             // Best-effort attempt to delete unneeded batches.
                             future::join_all(batches.into_iter().map(|b| b.batch.delete())).await;
                         }
@@ -1398,4 +1439,82 @@ fn append_batches<'scope>(
     }));
 
     (upper_stream, errors, shutdown_button.press_on_drop())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frontier(ts: u64) -> Antichain<mz_repr::Timestamp> {
+        Antichain::from_elem(mz_repr::Timestamp::new(ts))
+    }
+
+    #[mz_ore::test]
+    fn read_only_upper_advanced_past_batch_when_upper_reaches_batch_upper() {
+        let batch_lower = frontier(10);
+        let batch_upper = frontier(11);
+
+        assert!(read_only_upper_advanced_past_batch(
+            &batch_lower,
+            &batch_upper,
+            &batch_upper
+        ));
+    }
+
+    #[mz_ore::test]
+    fn read_only_upper_advanced_past_batch_when_upper_partially_covers_batch() {
+        let batch_lower = frontier(10);
+        let batch_upper = frontier(20);
+        let current_upper = frontier(15);
+
+        assert!(read_only_upper_advanced_past_batch(
+            &batch_lower,
+            &batch_upper,
+            &current_upper
+        ));
+    }
+
+    #[mz_ore::test]
+    fn read_only_upper_not_advanced_when_upper_is_still_at_batch_lower() {
+        let batch_lower = frontier(10);
+        let batch_upper = frontier(20);
+
+        assert!(!read_only_upper_advanced_past_batch(
+            &batch_lower,
+            &batch_upper,
+            &batch_lower
+        ));
+    }
+
+    #[mz_ore::test]
+    fn externally_committed_batch_reports_batch_upper() {
+        let reported_upper = frontier(10);
+        let batch_upper = frontier(20);
+        let actual_upper = frontier(20);
+
+        assert_eq!(
+            externally_committed_batch_upper_to_report(
+                &reported_upper,
+                &batch_upper,
+                &actual_upper
+            ),
+            Some(batch_upper)
+        );
+    }
+
+    #[mz_ore::test]
+    fn externally_committed_batch_does_not_report_partial_coverage() {
+        let reported_upper = frontier(10);
+        let batch_upper = frontier(20);
+        let actual_upper = frontier(15);
+
+        assert_eq!(
+            externally_committed_batch_upper_to_report(
+                &reported_upper,
+                &batch_upper,
+                &actual_upper
+            ),
+            None
+        );
+    }
 }
