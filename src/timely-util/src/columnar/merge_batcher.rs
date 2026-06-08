@@ -219,6 +219,23 @@ fn account_chunk<C: Columnar>(entry: &PagedColumn<C>) -> (usize, usize, usize, u
     }
 }
 
+/// Uncompressed body size of a chain, summed across entries whether they're
+/// resident or paged. Unlike [`account_chunk`] (which reports only RSS), this
+/// counts paged entries at their `Meta::len_bytes` so it tracks the data
+/// volume a merge step moved, not just what stayed resident. Used as a
+/// fuel metric for incremental seal-time merging.
+fn chain_bytes<C: Columnar>(chain: &VecDeque<PagedColumn<C>>) -> usize {
+    chain
+        .iter()
+        .map(|entry| match entry {
+            PagedColumn::Resident(col, _) => col.length_in_bytes(),
+            PagedColumn::Paged { meta, .. } | PagedColumn::Compressed { meta, .. } => {
+                meta.len_bytes
+            }
+        })
+        .sum()
+}
+
 impl<D, T, R> Batcher for ColumnMergeBatcher<D, T, R>
 where
     D: Columnar,
@@ -332,22 +349,75 @@ where
     for<'a> columnar::Ref<'a, T>: Copy + Ord,
     R: Columnar + Default + Semigroup + for<'a> Semigroup<columnar::Ref<'a, R>>,
 {
+    /// Number of sorted chains currently held. [`Batcher::seal`] collapses
+    /// these into a single run before extracting; a driver that wants to
+    /// bound the synchronous merge work per step can watch this and drive the
+    /// collapse one pair at a time via [`Self::merge_one`].
+    pub fn chain_count(&self) -> usize {
+        self.chains.len()
+    }
+
+    /// Merge a single pair of chains, collapsing the spine by one, and return
+    /// the uncompressed byte size of the two inputs merged (a fuel measure for
+    /// the work done). A no-op returning 0 once one chain (or none) remains.
+    ///
+    /// The fuel counts input bytes, not output: a heavily-consolidating merge
+    /// (e.g. many updates to one key folding via the `Semigroup`) does work
+    /// proportional to its input while producing a tiny output, so charging the
+    /// output would let such a merge run unbroken. The driver budgets against
+    /// the work it actually paid for.
+    ///
+    /// Replays exactly the per-pair step [`Batcher::seal`] performs internally
+    /// — pop the two youngest chains, merge, push the result — so driving
+    /// `while b.chain_count() > 1 { b.merge_one(); }` to completion leaves the
+    /// batcher in the same single-chain state a `seal` would reach before
+    /// extraction. Exposed so a driver can yield and drain other work between
+    /// steps rather than pay one unbroken O(N) merge.
+    pub fn merge_one(&mut self) -> usize {
+        if self.chains.len() <= 1 {
+            return 0;
+        }
+        let a = self.chain_pop().unwrap();
+        let b = self.chain_pop().unwrap();
+        let fuel = chain_bytes(&a) + chain_bytes(&b);
+        let merged = self.merge_by(a, b);
+        self.chain_push(merged);
+        fuel
+    }
+
+    /// Page `chunk` and insert it as a singleton chain, returning the bytes
+    /// merged by the rebalance it triggered (a fuel measure, in the units of
+    /// [`Self::merge_one`]). Same insertion the [`PushInto`] path performs, but
+    /// reports its synchronous merge work so an async driver can yield between
+    /// pushes rather than let a snapshot's geometric merges monopolize the
+    /// thread — the merge `chunk.push_into` hides is exactly the
+    /// `merge_from`-dominated cost that stalls a busy ingest.
+    pub fn push_fueled(&mut self, mut chunk: Column<(D, T, R)>) -> usize {
+        let pager = self.pager();
+        let paged = pager.page(&mut chunk);
+        self.insert_chain(VecDeque::from([paged]))
+    }
+
     /// Insert `chain` and rebalance: while the youngest chain is at least
-    /// half the size of its predecessor, merge them.
-    fn insert_chain(&mut self, chain: VecDeque<PagedColumn<(D, T, R)>>) {
+    /// half the size of its predecessor, merge them. Returns the bytes merged
+    /// by the rebalance (0 if the chain was just appended without merging).
+    fn insert_chain(&mut self, chain: VecDeque<PagedColumn<(D, T, R)>>) -> usize {
         if chain.is_empty() {
-            return;
+            return 0;
         }
         self.chain_push(chain);
+        let mut fuel = 0;
         while self.chains.len() > 1
             && self.chains[self.chains.len() - 1].len()
                 >= self.chains[self.chains.len() - 2].len() / 2
         {
             let a = self.chain_pop().unwrap();
             let b = self.chain_pop().unwrap();
+            fuel += chain_bytes(&a) + chain_bytes(&b);
             let merged = self.merge_by(a, b);
             self.chain_push(merged);
         }
+        fuel
     }
 
     /// Merge two sorted chains. Outputs are routed through `self.pager.page`
@@ -961,6 +1031,90 @@ mod tests {
         let mut out_sorted = out.clone();
         out_sorted.sort();
         assert_eq!(out_sorted, expected);
+    }
+
+    /// Driving `merge_one` to completion before `seal` leaves the batcher in
+    /// the same single-chain state a one-shot `seal` would, producing
+    /// identical, fully-consolidated output. Each step collapses exactly one
+    /// chain and reports the bytes it moved.
+    #[mz_ore::test]
+    fn merge_one_matches_one_shot_seal() {
+        fn build() -> ColumnMergeBatcher<(u64, u64), u64, i64> {
+            let mut b: ColumnMergeBatcher<(u64, u64), u64, i64> =
+                differential_dataflow::trace::Batcher::new(None, 0);
+            // Interleave keys across chunks so the chains genuinely overlap and
+            // some folds consolidate (every key appears at two times).
+            for i in 0..64u64 {
+                b.push_into(col(&[((i, 0), i % 4, 1)]));
+                b.push_into(col(&[((i, 0), i % 4, 1)]));
+            }
+            b
+        }
+
+        let upper = Antichain::from_elem(u64::MAX);
+
+        // One-shot reference.
+        let mut reference = build();
+        let (chain, _) = differential_dataflow::trace::Batcher::seal(&mut reference, upper.clone());
+        let mut expected: Vec<KvUpdate> = chain.iter().flat_map(collect_column).collect();
+        expected.sort();
+
+        // Incremental drive: collapse via merge_one, then seal (extract-only).
+        let mut incremental = build();
+        assert!(incremental.chain_count() > 1, "expected multiple chains");
+        let mut total_fuel = 0;
+        while incremental.chain_count() > 1 {
+            let before = incremental.chain_count();
+            total_fuel += incremental.merge_one();
+            assert_eq!(
+                incremental.chain_count(),
+                before - 1,
+                "merge_one should collapse exactly one chain"
+            );
+        }
+        assert!(total_fuel > 0, "merge_one should report bytes moved");
+        // A fully collapsed batcher reports nothing more to merge.
+        assert_eq!(incremental.merge_one(), 0);
+
+        let (chain, _) = differential_dataflow::trace::Batcher::seal(&mut incremental, upper);
+        let mut actual: Vec<KvUpdate> = chain.iter().flat_map(collect_column).collect();
+        actual.sort();
+
+        assert_eq!(actual, expected);
+    }
+
+    /// `push_fueled` is the [`PushInto`] path plus a fuel report: feeding the
+    /// same chunks through either produces identical sealed output, and
+    /// `push_fueled` reports nonzero bytes once a push triggers a rebalance
+    /// merge.
+    #[mz_ore::test]
+    fn push_fueled_matches_push_into() {
+        fn seal_all(fueled: bool) -> (Vec<KvUpdate>, usize) {
+            let mut b: ColumnMergeBatcher<(u64, u64), u64, i64> =
+                differential_dataflow::trace::Batcher::new(None, 0);
+            let mut fuel = 0;
+            for i in 0..32u64 {
+                let chunk = col(&[((i, 0), i % 4, 1)]);
+                if fueled {
+                    fuel += b.push_fueled(chunk);
+                } else {
+                    b.push_into(chunk);
+                }
+            }
+            let (chain, _) =
+                differential_dataflow::trace::Batcher::seal(&mut b, Antichain::from_elem(u64::MAX));
+            let mut out: Vec<KvUpdate> = chain.iter().flat_map(collect_column).collect();
+            out.sort();
+            (out, fuel)
+        }
+
+        let (via_push_into, _) = seal_all(false);
+        let (via_push_fueled, fuel) = seal_all(true);
+        assert_eq!(via_push_fueled, via_push_into);
+        assert!(
+            fuel > 0,
+            "push_fueled should report bytes merged by a rebalance"
+        );
     }
 
     #[mz_ore::test]

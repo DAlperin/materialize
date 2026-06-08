@@ -83,8 +83,8 @@ use mz_repr::{Datum, Diff, GlobalId, Row};
 use mz_row_spine::{ValRowColPagedBuilder, ValRowSpine};
 use mz_storage_types::errors::{DataflowError, EnvelopeError, UpsertError};
 use mz_timely_util::builder_async::{
-    AsyncOutputHandle, Event as AsyncEvent, OperatorBuilder as AsyncOperatorBuilder,
-    PressOnDropButton,
+    AsyncInputHandle, AsyncOutputHandle, ConnectedToOne, Event as AsyncEvent,
+    OperatorBuilder as AsyncOperatorBuilder, PressOnDropButton,
 };
 use mz_timely_util::columnar::batcher::ColumnChunker;
 use mz_timely_util::columnar::builder::ColumnBuilder;
@@ -163,14 +163,17 @@ where
     }
 }
 
-/// Consolidate `updates` through `chunker` into `Column` chunks and push them
-/// into `batcher`, emptying `updates` (keeping its capacity). The chunker
-/// readies a fully-consolidated chunk per `push_into`, so the `extract` loop
-/// drains everything it produced.
-fn flush_to_batcher<T, O>(
+/// Consolidate `updates` through `chunker` into sorted `Column` chunks and push
+/// them into `batcher`, emptying `updates` (keeping its capacity). The push is
+/// where the batcher's geometric merge lands — a synchronous, `merge_from`-bound
+/// cost — so it is fueled: once a run of pushes has merged `budget` bytes the
+/// call yields to timely, breaking up the merge so it can't monopolize the
+/// worker. The caller drains source input between flushes to keep intake alive.
+async fn flush_to_batcher<T, O>(
     updates: &mut Vec<UpsertUpdate<T, O>>,
     chunker: &mut UpsertChunker<T, O>,
     batcher: &mut UpsertBatcher<T, O>,
+    budget: usize,
 ) where
     T: columnar::Columnar + Default + Clone + PartialOrder,
     for<'a> columnar::Ref<'a, T>: Copy + Ord,
@@ -178,16 +181,20 @@ fn flush_to_batcher<T, O>(
     for<'a> columnar::Ref<'a, O>: Ord,
 {
     use timely::container::{ContainerBuilder as _, PushInto as _};
-    if updates.is_empty() {
-        return;
+    if !updates.is_empty() {
+        let mut raw: Column<UpsertUpdate<T, O>> = Default::default();
+        for update in updates.drain(..) {
+            raw.push_into(&update);
+        }
+        chunker.push_into(&mut raw);
     }
-    let mut raw: Column<UpsertUpdate<T, O>> = Default::default();
-    for update in updates.drain(..) {
-        raw.push_into(&update);
-    }
-    chunker.push_into(&mut raw);
+    let mut merge_fuel = 0;
     while let Some(chunk) = chunker.extract() {
-        batcher.push_into(std::mem::take(chunk));
+        merge_fuel += batcher.push_fueled(std::mem::take(chunk));
+        if merge_fuel >= budget {
+            merge_fuel = 0;
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -275,6 +282,115 @@ fn decode_upsert_value<'a>(mut iter: impl Iterator<Item = Datum<'a>>) -> UpsertV
             Err(Box::new(err))
         }
         tag => panic!("unknown upsert value tag {tag}"),
+    }
+}
+
+/// Byte budget bounding the synchronous stash work the operator does between
+/// yields, used at three sites: as a buffering cap on the ingest side
+/// ([`drain_input_to_buffer`], bounding raw bytes held in `push_buffer`), and
+/// as a merge-work cap on the push and seal sides (the geometric merge inside
+/// [`flush_to_batcher`], which dominates during a source snapshot, and the
+/// chain collapse via [`UpsertBatcher::merge_one`]). Once a run at any site has
+/// processed this many bytes the operator yields to timely, so a large snapshot
+/// or merge backlog neither monopolizes the worker nor stalls source intake. A
+/// responsiveness knob, sized well below the output edge's own 128 MiB
+/// [`give_fueled`] yield budget.
+///
+/// [`give_fueled`]: mz_timely_util::builder_async::AsyncOutputHandle::give_fueled
+const STASH_FUEL_BYTES: usize = 32 * 1024 * 1024;
+
+/// One source event from the input handle, as produced by [`AsyncInputHandle`].
+///
+/// [`AsyncInputHandle`]: mz_timely_util::builder_async::AsyncInputHandle
+type UpsertInputEvent<T, FromTime> =
+    AsyncEvent<T, Capability<T>, Vec<((UpsertKey, Option<UpsertValue>, FromTime), T, Diff)>>;
+
+/// The operator's source input handle: a single connected input carrying the
+/// raw upsert commands.
+type UpsertInput<T, FromTime> =
+    AsyncInputHandle<T, Vec<((UpsertKey, Option<UpsertValue>, FromTime), T, Diff)>, ConnectedToOne>;
+
+/// Apply one source `event` to the operator's ingest state and return the
+/// approximate payload bytes it buffered (0 for progress events). Progress
+/// events advance `input_upper`; data events project each command into an
+/// [`UpsertDiff`] (carrying the `FromTime` order key for dedup) and buffer it
+/// in `push_buffer`, tracking the minimum capability across buffered data in
+/// `stash_cap`. Commands below `resume_upper` are dropped (already persisted).
+///
+/// The byte count drives [`drain_input_to_buffer`]'s fuel budget so ingest is
+/// bounded per batch.
+fn ingest_event<T, FromTime>(
+    event: UpsertInputEvent<T, FromTime>,
+    input_upper: &mut Antichain<T>,
+    resume_upper: &Antichain<T>,
+    push_buffer: &mut Vec<UpsertUpdate<T, FromTime::Order>>,
+    stash_cap: &mut Option<Capability<T>>,
+) -> usize
+where
+    T: Timestamp,
+    FromTime: UpsertSourceTime,
+{
+    match event {
+        AsyncEvent::Data(cap, data) => {
+            let mut pushed_any = false;
+            let mut bytes = 0;
+            for ((key, value, from_time), ts, diff) in data {
+                assert!(diff.is_positive(), "invalid upsert input");
+                if PartialOrder::less_equal(&*input_upper, resume_upper)
+                    && !resume_upper.less_equal(&ts)
+                {
+                    continue;
+                }
+                let value = value.as_ref().map(upsert_value_to_row);
+                bytes += value.as_ref().map_or(0, Row::byte_len) + std::mem::size_of::<UpsertKey>();
+                let from_time = from_time.upsert_order();
+                push_buffer.push((key, ts, UpsertDiff { from_time, value }));
+                pushed_any = true;
+            }
+            // Track the minimum capability across all buffered data so we can
+            // emit output at the correct times.
+            if pushed_any {
+                *stash_cap = Some(match stash_cap.take() {
+                    Some(prev) if PartialOrder::less_than(cap.time(), prev.time()) => cap,
+                    Some(prev) => prev,
+                    None => cap,
+                });
+            }
+            bytes
+        }
+        AsyncEvent::Progress(upper) => {
+            // Progress carries no payload, so it buffers no bytes.
+            if PartialOrder::less_than(&upper, resume_upper) {
+                return 0;
+            }
+            *input_upper = upper;
+            0
+        }
+    }
+}
+
+/// Drain available source input into `push_buffer`, stopping when the channel
+/// empties or `budget` bytes have been buffered. Bounding the buffer lets the
+/// caller flush it in one fueled [`flush_to_batcher`] rather than pile a whole
+/// wakeup's worth of events into one unbroken consolidate-and-merge; input the
+/// budget left behind is picked up on the next wakeup.
+fn drain_input_to_buffer<T, FromTime>(
+    input: &mut UpsertInput<T, FromTime>,
+    input_upper: &mut Antichain<T>,
+    resume_upper: &Antichain<T>,
+    push_buffer: &mut Vec<UpsertUpdate<T, FromTime::Order>>,
+    stash_cap: &mut Option<Capability<T>>,
+    budget: usize,
+) where
+    T: Timestamp,
+    FromTime: UpsertSourceTime + 'static,
+{
+    let mut batch_bytes = 0;
+    while let Some(event) = input.next_sync() {
+        batch_bytes += ingest_event(event, input_upper, resume_upper, push_buffer, stash_cap);
+        if batch_bytes >= budget {
+            break;
+        }
     }
 }
 
@@ -468,48 +584,29 @@ where
             }
 
             // ── Step 1: Ingest source data ────────────────────────────────
-            // Read all available source events, wrap each value in an
-            // UpsertDiff (carrying FromTime for dedup), and buffer them.
-            // Events before the resume_upper are dropped (already persisted).
-            while let Some(event) = input.next_sync() {
-                match event {
-                    AsyncEvent::Data(cap, data) => {
-                        let mut pushed_any = false;
-                        for ((key, value, from_time), ts, diff) in data {
-                            assert!(diff.is_positive(), "invalid upsert input");
-                            if PartialOrder::less_equal(&input_upper, &resume_upper)
-                                && !resume_upper.less_equal(&ts)
-                            {
-                                continue;
-                            }
-                            let value = value.as_ref().map(upsert_value_to_row);
-                            let from_time = from_time.upsert_order();
-                            push_buffer.push((key, ts, UpsertDiff { from_time, value }));
-                            pushed_any = true;
-                        }
-                        // Track the minimum capability across all buffered data
-                        // so we can emit output at the correct times.
-                        if pushed_any {
-                            stash_cap = Some(match stash_cap {
-                                Some(prev) if cap.time() < prev.time() => cap,
-                                Some(prev) => prev,
-                                None => cap,
-                            });
-                        }
-                    }
-                    AsyncEvent::Progress(upper) => {
-                        if PartialOrder::less_than(&upper, &resume_upper) {
-                            continue;
-                        }
-                        input_upper = upper;
-                    }
-                }
-            }
-
-            // Flush buffered events through the chunker into the batcher. This
-            // triggers the chunker + geometric chain merging, which consolidates
-            // entries for the same (key, time) via the UpsertDiff Semigroup.
-            flush_to_batcher(&mut push_buffer, &mut chunker, &mut batcher);
+            // Drain one bounded batch of input and flush it into the batcher.
+            // The flush fuels the geometric merges so they can't monopolize the
+            // worker, and bounding the batch keeps a large snapshot from piling
+            // a whole wakeup's worth of events into one unbroken merge. We do a
+            // single batch per wakeup and fall through to Steps 2-4 so emission
+            // and frontier progress every wakeup; if input remains, the outer
+            // `select!` re-fires immediately and we ingest the next batch — so a
+            // large snapshot is consumed incrementally without starving output.
+            drain_input_to_buffer(
+                &mut input,
+                &mut input_upper,
+                &resume_upper,
+                &mut push_buffer,
+                &mut stash_cap,
+                STASH_FUEL_BYTES,
+            );
+            flush_to_batcher(
+                &mut push_buffer,
+                &mut chunker,
+                &mut batcher,
+                STASH_FUEL_BYTES,
+            )
+            .await;
 
             // ── Step 2: Read persist frontier ─────────────────────────────
             // The persist probe tells us which output times have been
@@ -589,9 +686,31 @@ where
                 && !persist_upper.less_than(cap.time())
                 && PartialOrder::less_than(&persist_upper, &input_upper)
             {
-                // Step 1 already consolidated `push_buffer` through the chunker
-                // (which readies a complete chunk per `push_into`), so the
-                // chunker holds nothing pending here and we can seal directly.
+                // Collapse the batcher's chains into a single sorted run before
+                // extracting. `seal` would do this in one unbroken O(N) merge;
+                // drive it one chain-pair at a time instead, yielding once a run
+                // of merges has moved `STASH_FUEL_BYTES`, so the collapse can't
+                // monopolize the worker.
+                //
+                // We deliberately do NOT drain input here. Flushing new input
+                // mid-collapse would add chains and force `merge_one` to
+                // re-merge the growing collapsed chain on every round — turning
+                // one bounded O(N) collapse into a quadratic one (the pathology
+                // the eligibility guard exists to avoid). Source intake resumes
+                // in Step 1 next iteration; unlike the snapshot ingest Step 1
+                // fuels, this collapse is a bounded, one-time cost.
+                let mut merge_fuel = 0;
+                while batcher.chain_count() > 1 {
+                    merge_fuel += batcher.merge_one();
+                    if merge_fuel >= STASH_FUEL_BYTES {
+                        merge_fuel = 0;
+                        tokio::task::yield_now().await;
+                    }
+                }
+
+                // Chains are collapsed, so this `seal` only extracts. Step 1
+                // fully drained `push_buffer` through the chunker, so nothing is
+                // pending there.
                 let (sealed, _description) = batcher.seal(input_upper.clone());
                 // Frontier of data remaining in the batcher (ts >= input_upper).
                 let remaining_frontier = batcher.frontier().to_owned();
@@ -633,7 +752,15 @@ where
                 // remaining data: either entries still in the batcher (above
                 // input_upper) or ineligible entries being pushed back.
                 let min_ineligible_ts = ineligible.iter().map(|(_, ts, _)| ts).min().cloned();
-                flush_to_batcher(&mut ineligible, &mut chunker, &mut batcher);
+                // Re-stash the ineligible entries; the flush fuels the push so
+                // the geometric merges they trigger can't monopolize the worker.
+                flush_to_batcher(
+                    &mut ineligible,
+                    &mut chunker,
+                    &mut batcher,
+                    STASH_FUEL_BYTES,
+                )
+                .await;
 
                 let has_remaining = !remaining_frontier.is_empty() || min_ineligible_ts.is_some();
                 if has_remaining {
